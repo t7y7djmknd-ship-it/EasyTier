@@ -1,129 +1,237 @@
-name: Core (HC5861 optimized)
+name: EasyTier Personal Core
 
 on:
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "要发布到的 Release tag(留空则只生成 Artifact,不发布 Release)"
-        required: false
-        default: ""
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-C panic=abort"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
+
   build:
-    name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.ARTIFACT_NAME }}
+
     strategy:
-      fail-fast: false
+      fail-fast: true
+
       matrix:
         include:
-          # 两台 HC5861(MT7620A, MIPS 小端, 弱 CPU/内存)
-          - target: mipsel-unknown-linux-musl
-            is_mips: true
-            artifact_name: easytier-mipsel-hc5861
 
-          # 中转 VPS(x86_64, 资源充裕, 走常规 release 构建)
-          - target: x86_64-unknown-linux-musl
-            is_mips: false
-            artifact_name: easytier-x86_64-vps
+          # ==========================================================
+          # HC5861
+          # MediaTek MT7620A
+          # OpenWrt 23.05.4
+          # MIPS32 little-endian / mipsel_24kc
+          # ==========================================================
+          - TARGET: mipsel-unknown-linux-musl
+            OS: ubuntu-24.04
+            ARTIFACT_NAME: linux-mipsel
+
+          # ==========================================================
+          # Personal VPS
+          # Debian Linux x86_64
+          # ==========================================================
+          - TARGET: x86_64-unknown-linux-musl
+            OS: ubuntu-24.04
+            ARTIFACT_NAME: linux-x86_64
+
+    runs-on: ${{ matrix.OS }}
+
+    env:
+      TARGET: ${{ matrix.TARGET }}
+      OS: ${{ matrix.OS }}
 
     steps:
+
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Install Rust nightly (MIPS 需要 -Z build-std, 必须 nightly)
-        if: matrix.is_mips
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: ${{ matrix.target }}
-          components: rust-src
-
-      - name: Install Rust stable (VPS 用普通 stable 即可)
-        if: ${{ !matrix.is_mips }}
+      # ------------------------------------------------------------
+      # Rust toolchain
+      # ------------------------------------------------------------
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          toolchain: nightly
+          targets: |
+            ${{ matrix.TARGET }}
 
-      - name: Setup protoc
-        uses: arduino/setup-protoc@v3
+      # ------------------------------------------------------------
+      # Rust cache
+      # ------------------------------------------------------------
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          prefix-key: easytier-personal
+          shared-key: ${{ matrix.TARGET }}
+          cache-targets: "false"
 
-      - name: Cache cargo & target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.target }}-
+      # ------------------------------------------------------------
+      # Build dependencies
+      # ------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          set -eux
 
-      # ------- HC5861(MIPS)专用构建：优先压体积、降运行时内存占用 -------
-      # opt-level=z   : 以体积最小为目标优化(而不是速度),弱设备上 I/O/网络是瓶颈, CPU 峰值需求不高
-      # lto=fat       : 全量链接时优化,进一步裁掉无用代码路径
-      # codegen-units=1: 牺牲编译并行度换运行时性能/体积(反正在 CI 的强机器上编译, 不心疼编译时间)
-      # strip=symbols : 链接阶段直接去掉符号表, 减小最终文件体积
-      # --features mips / --no-default-features: 沿用上游针对 MIPS 的必需 feature 开关(见下方说明)
-      - name: Build (HC5861 / mipsel tuned)
-        if: matrix.is_mips
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            llvm \
+            lld \
+            pkg-config \
+            protobuf-compiler \
+            musl-tools \
+            curl \
+            xz-utils
+
+      # ------------------------------------------------------------
+      # Build
+      #
+      # MIPS:
+      #   EasyTier upstream workflow uses build-std because
+      #   the MIPS target requires rebuilding std/panic_abort.
+      #
+      # x86_64:
+      #   Normal musl release build.
+      # ------------------------------------------------------------
+      - name: Build EasyTier
         env:
-          RUSTFLAGS: "-C opt-level=z -C lto=fat -C codegen-units=1 -C strip=symbols"
+          RUSTC_BOOTSTRAP: 1
         run: |
-          cargo +nightly build --release --verbose \
-            --target ${{ matrix.target }} \
-            -Z build-std \
-            --no-default-features --features mips
+          set -eux
 
-      # ------- VPS(x86_64)构建：正常性能优先, 同样做体积裁剪但不追极致 -------
-      - name: Build (VPS / x86_64)
-        if: ${{ !matrix.is_mips }}
-        env:
-          RUSTFLAGS: "-C opt-level=3 -C lto=fat -C codegen-units=1 -C strip=symbols"
-        run: |
-          cargo build --release --verbose \
-            --target ${{ matrix.target }}
+          if [[ "$TARGET" == "mipsel-unknown-linux-musl" ]]; then
 
-      - name: Collect & strip binaries
-        run: |
-          set -e
-          BIN_DIR="target/${{ matrix.target }}/release"
-          mkdir -p out
-          cp "$BIN_DIR/easytier-core" out/
-          cp "$BIN_DIR/easytier-cli" out/
-          # RUSTFLAGS 的 strip=symbols 通常已经够用, 这里再兜底跑一次 strip
-          if command -v ${{ matrix.target }}-strip >/dev/null 2>&1; then
-            ${{ matrix.target }}-strip out/easytier-core out/easytier-cli || true
+            cargo build \
+              --release \
+              --target "$TARGET" \
+              -Z build-std=std,panic_abort \
+              --package easytier \
+              --features=jemalloc
+
           else
-            strip out/easytier-core out/easytier-cli || true
+
+            cargo build \
+              --release \
+              --target "$TARGET" \
+              --package easytier \
+              --features=jemalloc
+
           fi
 
-      - name: Show binary info
+      # ------------------------------------------------------------
+      # Strip binaries
+      # ------------------------------------------------------------
+      - name: Strip binaries
         run: |
-          file out/easytier-core
-          ls -lh out/
+          set -eux
 
-      - name: Package
+          BIN_DIR="target/$TARGET/release"
+
+          for BIN in \
+            "$BIN_DIR/easytier-core" \
+            "$BIN_DIR/easytier-cli"
+          do
+            if [[ -f "$BIN" ]]; then
+              echo "Stripping $BIN"
+
+              if [[ "$TARGET" == "mipsel-unknown-linux-musl" ]]; then
+                llvm-strip "$BIN" || true
+              else
+                strip "$BIN" || true
+              fi
+            fi
+          done
+
+      # ------------------------------------------------------------
+      # Install UPX
+      #
+      # Only Linux binaries are produced here.
+      # UPX failure must not make the build fail.
+      # ------------------------------------------------------------
+      - name: Install UPX
         run: |
+          set -eux
+
+          UPX_VERSION=4.2.4
+          UPX_PKG="upx-${UPX_VERSION}-amd64_linux"
+
+          curl -L \
+            "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${UPX_PKG}.tar.xz" \
+            -o /tmp/upx.tar.xz
+
+          tar -xJf /tmp/upx.tar.xz -C /tmp
+
+          sudo cp \
+            "/tmp/${UPX_PKG}/upx" \
+            /usr/local/bin/upx
+
+          upx --version
+
+      # ------------------------------------------------------------
+      # Compress binaries
+      #
+      # For the personal low-traffic use case, compression is useful
+      # for reducing Flash usage, but it is not allowed to break CI.
+      # ------------------------------------------------------------
+      - name: Compress binaries
+        run: |
+          set -eux
+
+          BIN_DIR="target/$TARGET/release"
+
+          for BIN in \
+            "$BIN_DIR/easytier-core" \
+            "$BIN_DIR/easytier-cli"
+          do
+            if [[ -f "$BIN" ]]; then
+              echo "Compressing $BIN"
+              upx --lzma --best "$BIN" || true
+            fi
+          done
+
+      # ------------------------------------------------------------
+      # Prepare artifact
+      # ------------------------------------------------------------
+      - name: Prepare artifact
+        run: |
+          set -eux
+
           mkdir -p artifacts
-          tar -C out -czvf artifacts/${{ matrix.artifact_name }}.tar.gz easytier-core easytier-cli
 
+          BIN_DIR="target/$TARGET/release"
+
+          test -f "$BIN_DIR/easytier-core"
+          test -f "$BIN_DIR/easytier-cli"
+
+          cp "$BIN_DIR/easytier-core" artifacts/
+          cp "$BIN_DIR/easytier-cli" artifacts/
+
+          echo
+          echo "===== Binary information ====="
+          file artifacts/easytier-core
+          file artifacts/easytier-cli
+
+          echo
+          echo "===== Binary size ====="
+          ls -lh artifacts/
+
+      # ------------------------------------------------------------
+      # Upload
+      # ------------------------------------------------------------
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.artifact_name }}
-          path: artifacts/${{ matrix.artifact_name }}.tar.gz
-          retention-days: 90
-
-      - name: Publish to Release
-        if: ${{ github.event.inputs.release_tag != '' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.release_tag }}
-          files: artifacts/${{ matrix.artifact_name }}.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: easytier-${{ matrix.ARTIFACT_NAME }}
+          path: artifacts/*
+          if-no-files-found: error
